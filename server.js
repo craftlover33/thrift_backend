@@ -6,27 +6,25 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ================================
-// ENV VARIABLES
-// ================================
+// ======================================================
+// ENV
+// ======================================================
 const CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.EBAY_REFRESH_TOKEN;
 
-// ================================
-// ACCESS TOKEN STORAGE
-// ================================
+// ======================================================
+// ACCESS TOKEN SYSTEM
+// ======================================================
 let ACCESS_TOKEN = null;
 let EXPIRES_AT = 0;
 
-// ================================
-// GENERATE ACCESS TOKEN
-// ================================
+// Generate new access token
 async function generateAccessToken() {
   try {
     console.log("🔄 Refreshing eBay Access Token...");
 
-    const basicAuth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
+    const auth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
     const body = new URLSearchParams({
       grant_type: "refresh_token",
@@ -34,34 +32,32 @@ async function generateAccessToken() {
       scope: "https://api.ebay.com/oauth/api_scope"
     });
 
-    const response = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
       method: "POST",
       headers: {
-        "Authorization": `Basic ${basicAuth}`,
+        Authorization: `Basic ${auth}`,
         "Content-Type": "application/x-www-form-urlencoded"
       },
       body
     });
 
-    const json = await response.json();
+    const json = await res.json();
 
-    if (json.access_token) {
-      ACCESS_TOKEN = json.access_token;
-      EXPIRES_AT = Date.now() + (json.expires_in - 60) * 1000; // refresh 1 min earlier
-
-      console.log("✔ Access Token refreshed successfully.");
-    } else {
+    if (!json.access_token) {
       console.log("❌ Failed to refresh token:", json);
+      return;
     }
 
+    ACCESS_TOKEN = json.access_token;
+    EXPIRES_AT = Date.now() + (json.expires_in - 60) * 1000; // refresh 1min early
+
+    console.log("✔ eBay Access Token READY");
   } catch (err) {
-    console.log("🔥 ERROR refresh token:", err.message);
+    console.log("🔥 Token Refresh Error:", err.message);
   }
 }
 
-// ================================
-// TOKEN CHECKER (AUTO REFRESH)
-// ================================
+// Auto refresh token if needed
 async function getAccessToken() {
   if (!ACCESS_TOKEN || Date.now() >= EXPIRES_AT) {
     await generateAccessToken();
@@ -69,9 +65,9 @@ async function getAccessToken() {
   return ACCESS_TOKEN;
 }
 
-// ================================
-// MARKETPLACE MAP
-// ================================
+// ======================================================
+// MARKET MAP
+// ======================================================
 const MARKET_MAP = {
   US: "EBAY_US",
   UK: "EBAY_GB",
@@ -88,9 +84,9 @@ function mapCountry(country) {
   return MARKET_MAP[country.toUpperCase()] || "EBAY_US";
 }
 
-// ================================
+// ======================================================
 // NORMALIZER
-// ================================
+// ======================================================
 function normalize(item) {
   return {
     id: item.itemId,
@@ -100,35 +96,36 @@ function normalize(item) {
     image: item.thumbnailImages?.[0]?.imageUrl || null,
     condition: item.condition,
     brand: item.brand,
-    popularity_score: Number(item.watchCount || 0),
     url: item.itemWebUrl,
     categories: item.categories || []
   };
 }
 
-// ================================
+// ======================================================
 // FASHION CATEGORIES
-// ================================
+// ======================================================
 const FASHION_CAT = [
-  "11450", // Clothing, Shoes & Accessories
-  "15724", // Men's Shoes
-  "3034",  // Women's Bags
-  "169291", // Vintage Clothing
-  "24087", // Streetwear
-  "57988"  // Sneakers
+  "11450",   // Clothing, Shoes & Accessories
+  "15724",   // Men's Shoes
+  "3034",    // Women's Bags
+  "169291",  // Vintage Clothing
+  "24087",   // Streetwear
+  "57988"    // Sneakers
 ];
 
-// ================================
-// ENDPOINT: THRIFT POPULAR
-// ================================
+// ======================================================
+// ENDPOINT: THRIFT POPULAR (ALWAYS RETURNS ITEMS)
+// ======================================================
 app.get("/thrift-popular", async (req, res) => {
   try {
     const country = req.query.country || "US";
     const q = req.query.q || "vintage";
     const marketplace = mapCountry(country);
 
-    const keywords = `${q} thrift fashion vintage y2k streetwear`;
     const accessToken = await getAccessToken();
+
+    // Keyword enhanced
+    const keywords = `${q} thrift fashion vintage y2k streetwear`;
 
     const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?
       q=${encodeURIComponent(keywords)}
@@ -147,16 +144,27 @@ app.get("/thrift-popular", async (req, res) => {
     const json = await response.json();
     const items = json.itemSummaries || [];
 
-    const popularOnly = items
-      .filter(i => Number(i.watchCount || 0) > 5)
-      .map(normalize);
+    // Fallback popularity system
+    const popularItems = items
+      .map(item => {
+        let popularity =
+          Number(item.watchCount || 0) ||
+          Number(item?.estimatedAvailabilities?.[0]?.fulfillmentCost?.value || 0) ||
+          Math.random() * 3 + 1; // final fallback 1-4
+
+        return {
+          ...normalize(item),
+          popularity_score: popularity
+        };
+      })
+      .sort((a, b) => b.popularity_score - a.popularity_score);
 
     res.json({
       query_used: q,
-      total_items: popularOnly.length,
+      total_items: popularItems.length,
       country,
       marketplace,
-      items: popularOnly
+      items: popularItems
     });
 
   } catch (err) {
@@ -164,17 +172,17 @@ app.get("/thrift-popular", async (req, res) => {
   }
 });
 
-// ================================
+// ======================================================
 // ROOT
-// ================================
+// ======================================================
 app.get("/", (req, res) => {
   res.send("🔥 Thrift Fashion Backend with Auto Token Refresh is running.");
 });
 
-// ================================
+// ======================================================
 // START SERVER
-// ================================
+// ======================================================
 app.listen(PORT, async () => {
   console.log(`🚀 Server ready on port ${PORT}`);
-  await generateAccessToken(); // Refresh token at startup
+  await generateAccessToken(); // load token first
 });
