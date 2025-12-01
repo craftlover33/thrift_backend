@@ -1,6 +1,6 @@
 // ======================================================
-// THRIFT FASHION BACKEND v3 (FINAL)
-// Trending + Search + Lookup + Recommendation
+// THRIFT FASHION BACKEND v4 (FINAL)
+// Trending + Search + Lookup + Recommend + PriceHistory + ChartData
 // ======================================================
 
 import express from "express";
@@ -480,15 +480,159 @@ app.get("/recommend", async (req, res) => {
 });
 
 // ======================================================
+// 5) /price-history (SOLD ITEMS)
+// ======================================================
+app.get("/price-history", async (req, res) => {
+  try {
+    const q = req.query.q;
+    const limit = req.query.limit || 30;
+
+    if (!q) return res.status(400).json({ error: "Parameter 'q' wajib diisi" });
+
+    const url =
+      "https://svcs.ebay.com/services/search/FindingService/v1?" +
+      "OPERATION-NAME=findCompletedItems" +
+      "&SERVICE-VERSION=1.13.0" +
+      "&RESPONSE-DATA-FORMAT=JSON" +
+      `&SECURITY-APPNAME=${process.env.EBAY_APP_ID}` +
+      `&keywords=${encodeURIComponent(q)}` +
+      "&sortOrder=EndTimeSoonest" +
+      `&paginationInput.entriesPerPage=${limit}`;
+
+    const resp = await fetch(url);
+    const json = await resp.json();
+
+    const items =
+      json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+
+    const soldItems = items
+      .filter(i => i.sellingStatus?.[0]?.sellingState?.[0] === "EndedWithSales")
+      .map(i => {
+        const price = Number(
+          i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0
+        );
+        return {
+          title: i.title?.[0] || "",
+          price,
+          url: i.viewItemURL?.[0] || "",
+          image: i.galleryURL?.[0] || null,
+          condition: i.condition?.[0]?.conditionDisplayName?.[0] || "Unknown",
+          endDate: i.listingInfo?.[0]?.endTime?.[0] || null,
+        };
+      });
+
+    if (soldItems.length === 0) {
+      return res.json({
+        query: q,
+        total_sold: 0,
+        items: [],
+      });
+    }
+
+    const prices = soldItems.map(i => i.price).sort((a, b) => a - b);
+    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+
+    let median;
+    if (prices.length % 2 === 0) {
+      median = (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2;
+    } else {
+      median = prices[Math.floor(prices.length / 2)];
+    }
+
+    res.json({
+      query: q,
+      total_sold: soldItems.length,
+      average_price: Number(avg.toFixed(2)),
+      lowest_price: prices[0],
+      highest_price: prices[prices.length - 1],
+      median_price: median,
+      items: soldItems,
+    });
+  } catch (error) {
+    console.error("❌ Price history error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ======================================================
+// 6) /chart-data (30/60/90 HARI)
+// ======================================================
+app.get("/chart-data", async (req, res) => {
+  try {
+    const q = req.query.q;
+    if (!q) return res.status(400).json({ error: "Parameter 'q' wajib diisi" });
+
+    const url =
+      "https://svcs.ebay.com/services/search/FindingService/v1?" +
+      "OPERATION-NAME=findCompletedItems" +
+      "&SERVICE-VERSION=1.13.0" +
+      "&RESPONSE-DATA-FORMAT=JSON" +
+      `&SECURITY-APPNAME=${process.env.EBAY_APP_ID}` +
+      `&keywords=${encodeURIComponent(q)}` +
+      "&sortOrder=EndTimeSoonest" +
+      "&paginationInput.entriesPerPage=120";
+
+    const resp = await fetch(url);
+    const json = await resp.json();
+
+    const items =
+      json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+
+    const sold = items
+      .filter(it => it.sellingStatus?.[0]?.sellingState?.[0] === "EndedWithSales")
+      .map(it => {
+        const price = Number(
+          it.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0
+        );
+        const date = new Date(it.listingInfo?.[0]?.endTime?.[0]);
+        return { price, date };
+      });
+
+    const now = new Date();
+    const days = d => new Date(now.getTime() - d * 24 * 60 * 60 * 1000);
+
+    const ranges = {
+      "30d": sold.filter(i => i.date >= days(30)),
+      "60d": sold.filter(i => i.date >= days(60)),
+      "90d": sold.filter(i => i.date >= days(90)),
+    };
+
+    const summary = range => {
+      if (range.length === 0) return null;
+      const prices = range.map(i => i.price);
+      const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+      return {
+        count: range.length,
+        average: Number(avg.toFixed(2)),
+        lowest: Math.min(...prices),
+        highest: Math.max(...prices),
+      };
+    };
+
+    res.json({
+      query: q,
+      chart: {
+        "30d": summary(ranges["30d"]),
+        "60d": summary(ranges["60d"]),
+        "90d": summary(ranges["90d"]),
+      },
+    });
+  } catch (err) {
+    console.error("❌ Chart data error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ======================================================
 // ROOT
 // ======================================================
 app.get("/", (req, res) => {
-  res.send("🔥 Thrift Fashion Backend v3 (Trending + Search + Lookup + Recommend) is running.");
+  res.send("🔥 Thrift Fashion Backend v4 (Trending + Search + Lookup + Recommend + PriceHistory + ChartData) is running.");
 });
 
 // ======================================================
 // START SERVER
 // ======================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Thrift Fashion Backend v3 running on port ${PORT}`);
+  console.log(`🚀 Thrift Fashion Backend v4 running on port ${PORT}`);
 });
