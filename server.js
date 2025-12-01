@@ -14,34 +14,23 @@ const EBAY_TOKEN = process.env.EBAY_TOKEN;
 const MARKET_MAP = {
   US: "EBAY_US",
   UK: "EBAY_GB",
-  GB: "EBAY_GB",
   AU: "EBAY_AU",
   CA: "EBAY_CA",
   DE: "EBAY_DE",
   FR: "EBAY_FR",
   IT: "EBAY_IT",
-  ES: "EBAY_ES",
-  AT: "EBAY_AT",
-  NL: "EBAY_NL",
-  CH: "EBAY_CH",
-  IE: "EBAY_IE",
-  PL: "EBAY_PL",
-  SG: "EBAY_SG",
-  HK: "EBAY_HK",
-  MY: "EBAY_MY",
-  PH: "EBAY_PH"
+  ES: "EBAY_ES"
 };
 
 function mapCountry(country) {
   if (!country) return "EBAY_US";
-  const upper = country.toUpperCase();
-  return MARKET_MAP[upper] || "EBAY_US";
+  return MARKET_MAP[country.toUpperCase()] || "EBAY_US";
 }
 
 // ==========================================
-// NORMALIZER — untuk fashion items
+// NORMALIZER (Fashion Only)
 // ==========================================
-function normalizeFashionItem(item) {
+function normalize(item) {
   if (!item) return null;
 
   return {
@@ -49,69 +38,73 @@ function normalizeFashionItem(item) {
     title: item.title,
     price: item.price?.value || null,
     currency: item.price?.currency || null,
-    image: item.thumbnailImages?.[0]?.imageUrl || item.image?.imageUrl || null,
+    image: item.thumbnailImages?.[0]?.imageUrl || null,
     condition: item.condition || null,
     brand: item.brand || null,
-    seller: item.seller?.username || null,
-    authenticity: item.authenticityGuarantee?.eligible ? "Guaranteed" : "Not guaranteed",
-    url: item.itemWebUrl || null
+    popularity_score: Number(item.watchCount || 0),
+    url: item.itemWebUrl || null,
+    categories: item.categories || [],
+    seller: item.seller?.username || null
   };
 }
 
 // ==========================================
-// ENDPOINT: THRIFT FASHION SEARCH
+// CATEGORIES khusus Fashion Thrift
 // ==========================================
-app.get("/thrift-fashion", async (req, res) => {
+const FASHION_CAT = [
+  "11450", // Clothing, Shoes & Accessories
+  "15724", // Men's Shoes
+  "3034",  // Women's Bags
+  "169291", // Vintage Clothing
+  "24087", // Streetwear
+  "57988" // Sneakers
+];
+
+// ==========================================
+// ENDPOINT: POPULAR FASHION THRIFT
+// ==========================================
+app.get("/thrift-popular", async (req, res) => {
   try {
-    const q = req.query.q;      // nama produk
-    const code = req.query.code; // UPC / EAN / GTIN
     const country = req.query.country || "US";
+    const q = req.query.q || "vintage"; // default trending
 
-    if (!q && !code) {
-      return res.status(400).json({
-        error: "Parameter 'q' (nama produk) atau 'code' (barcode) wajib diisi"
-      });
-    }
-
-    const market = mapCountry(country);
+    const marketplace = mapCountry(country);
 
     // ==========================================
-    // BUILD QUERY
-    // Gunakan kategori khusus fashion:
-    // 11450 = Clothing & Accessories
-    // 15724 = Men's Shoes
-    // 3034 = Women's Bags
+    // KEYWORD fokus thrift fashion populer
     // ==========================================
-    const queryText = code
-      ? `gtin:${code}`
-      : `${q} fashion thrift vintage streetwear`;
+    const keywords = `${q} thrift fashion vintage y2k streetwear`;
 
     const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?
-        q=${encodeURIComponent(queryText)}
-        &category_ids=11450,15724,3034
-        &limit=20`.replace(/\s+/g, "");
+      q=${encodeURIComponent(keywords)}
+      &category_ids=${FASHION_CAT.join(",")}
+      &sort=BEST_MATCH
+      &limit=20`.replace(/\s+/g, "");
 
     const response = await fetch(url, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${EBAY_TOKEN}`,
-        "X-EBAY-C-MARKETPLACE-ID": market,
-        "Content-Type": "application/json"
+        "X-EBAY-C-MARKETPLACE-ID": marketplace
       }
     });
 
-    const raw = await response.json();
-    const items = raw.itemSummaries || [];
+    const json = await response.json();
+    const items = json.itemSummaries || [];
 
-    const normalized = items.map(normalizeFashionItem);
+    // Filter tambahan: hanya item populer
+    const popularOnly = items
+      .filter((i) => Number(i.watchCount || 0) > 5) // minimal ramai
+      .map(normalize);
 
     return res.json({
-      query_used: queryText,
+      query_used: q,
+      total_items: popularOnly.length,
       country,
-      marketplace: market,
-      result_count: normalized.length,
-      items: normalized
+      marketplace,
+      items: popularOnly
     });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -121,12 +114,12 @@ app.get("/thrift-fashion", async (req, res) => {
 // ROOT
 // ==========================================
 app.get("/", (req, res) => {
-  res.send("Thrift Fashion Backend is running ✔");
+  res.send("🔥 Thrift Fashion Popular Backend is running.");
 });
 
 // ==========================================
-// RUN SERVER
+// LISTEN
 // ==========================================
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`Server ready on port ${PORT}`)
+);
