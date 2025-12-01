@@ -45,9 +45,14 @@ async function getAccessToken() {
   });
 
   const data = await resp.json();
+
   if (!resp.ok || !data.access_token) {
-    console.log("❌ Cannot refresh eBay token:", data);
-    throw new Error("Cannot refresh eBay token");
+    console.error("❌ Cannot refresh eBay token:", data);
+    const msg =
+      data?.error_description ||
+      data?.errors?.[0]?.message ||
+      JSON.stringify(data);
+    throw new Error("Cannot refresh eBay token: " + msg);
   }
 
   accessToken = data.access_token;
@@ -84,7 +89,6 @@ const cacheStore = new Map();
 function setCache(key, val, ttlMs) {
   cacheStore.set(key, { val, exp: Date.now() + ttlMs });
 }
-
 function getCache(key) {
   const d = cacheStore.get(key);
   if (!d) return null;
@@ -129,7 +133,7 @@ const BLOCK_WORDS = [
 
   // Barang rumah tangga
   "mug", "cup", "glass", "lamp", "furniture", "sofa", "chair", "table",
-  "poster", "canvas", "print set",
+  "canvas", "print set",
 
   // Digital / template
   "pdf", "digital download", "template"
@@ -202,7 +206,7 @@ function normalizeThriftItem(item) {
 }
 
 // =============================
-// GENERIC EBAY SEARCH WRAPPER
+// GENERIC EBAY SEARCH WRAPPER (WITH BETTER ERROR)
 // =============================
 async function ebaySearch({ q, country = "US", extra = "" }) {
   const marketplace = resolveMarketplace(country);
@@ -228,9 +232,14 @@ async function ebaySearch({ q, country = "US", extra = "" }) {
   });
 
   const json = await resp.json();
+
   if (!resp.ok) {
-    console.log("❌ eBay search error:", json);
-    throw json;
+    console.error("❌ eBay search error:", JSON.stringify(json, null, 2));
+    const msg =
+      json?.errors?.[0]?.message ||
+      json?.error_description ||
+      JSON.stringify(json);
+    throw new Error("eBay search failed: " + msg);
   }
 
   setCache(cacheKey, json, 5 * 60 * 1000); // 5 menit cache
@@ -269,13 +278,17 @@ app.get("/thrift-trending", async (req, res) => {
     let found = [];
 
     for (const q of queries) {
-      const json = await ebaySearch({
-        q,
-        country,
-        extra: "&limit=50&sort=BEST_MATCH",
-      });
-
-      found.push(...(json.itemSummaries || []).filter(isFashion));
+      try {
+        const json = await ebaySearch({
+          q,
+          country,
+          extra: "&limit=50&sort=BEST_MATCH",
+        });
+        found.push(...(json.itemSummaries || []).filter(isFashion));
+      } catch (innerErr) {
+        console.error("⚠️ Trending query failed:", q, innerErr.message);
+        // skip query yang error, lanjut query lain
+      }
     }
 
     // Unik by title
@@ -300,6 +313,7 @@ app.get("/thrift-trending", async (req, res) => {
       items: enriched.slice(0, Number(limit)),
     });
   } catch (e) {
+    console.error("🔥 thrift-trending error:", e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
@@ -350,6 +364,7 @@ app.get("/thrift-search", async (req, res) => {
       items: paged.map(normalizeThriftItem),
     });
   } catch (e) {
+    console.error("🔥 thrift-search error:", e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
@@ -410,13 +425,13 @@ app.get("/lookup", async (req, res) => {
       items: items.map(normalizeThriftItem),
     });
   } catch (e) {
+    console.error("🔥 lookup error:", e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
 // ======================================================
 // 4) RECOMMENDATION ENDPOINT (/recommend)
-//    - Berdasarkan itemId (id) ATAU query (q)
 // ======================================================
 app.get("/recommend", async (req, res) => {
   try {
@@ -447,21 +462,18 @@ app.get("/recommend", async (req, res) => {
         baseBrand = itemJson.brand || "";
         basePrice = Number(itemJson.price?.value || 0);
 
-        // Jika q kosong, pakai title item sebagai query
         if (!q) {
           q = `${baseBrand ? baseBrand + " " : ""}${baseTitle}`;
         }
       } else {
-        console.log("⚠️ Failed to fetch base item for recommend:", itemJson);
+        console.warn("⚠️ Failed to fetch base item for recommend:", itemJson);
       }
     }
 
-    // Jika tidak ada id dan query kosong sama sekali → fallback ke thrift-trending keyword
     if (!q) {
       q = "vintage jacket";
     }
 
-    // Pencarian kandidat rekomendasi
     const raw = await ebaySearch({
       q,
       country,
@@ -470,12 +482,10 @@ app.get("/recommend", async (req, res) => {
 
     let items = (raw.itemSummaries || []).filter(isFashion);
 
-    // Filter: jangan masukkan item yang sama id-nya
     if (id) {
       items = items.filter(it => it.itemId !== id);
     }
 
-    // Hitung skor rekomendasi
     const baseWords = baseTitle
       ? baseTitle.toLowerCase().split(/\s+/).filter(w => w.length > 2)
       : [];
@@ -486,7 +496,6 @@ app.get("/recommend", async (req, res) => {
 
       let score = 0;
 
-      // Brand match
       if (
         baseBrand &&
         normalized.brand &&
@@ -495,25 +504,22 @@ app.get("/recommend", async (req, res) => {
         score += 25;
       }
 
-      // Kedekatan harga
       if (basePrice > 0 && priceVal > 0) {
         const diff = Math.abs(priceVal - basePrice);
-        const ratio = diff / basePrice; // 0 = sama persis
-        const priceScore = Math.max(0, 15 - ratio * 20); // makin dekat makin tinggi
+        const ratio = diff / basePrice;
+        const priceScore = Math.max(0, 15 - ratio * 20);
         score += priceScore;
       }
 
-      // Kemiripan kata di title
       if (baseWords.length && normalized.title) {
         const titleWords = normalized.title.toLowerCase().split(/\s+/);
         let overlap = 0;
         baseWords.forEach(w => {
           if (titleWords.includes(w)) overlap++;
         });
-        score += overlap * 2; // setiap kata sama +2
+        score += overlap * 2;
       }
 
-      // Sedikit random agar hasil tidak kaku
       score += Math.random() * 3;
 
       return {
@@ -537,6 +543,7 @@ app.get("/recommend", async (req, res) => {
       items: recommended.slice(0, Number(limit)),
     });
   } catch (e) {
+    console.error("🔥 recommend error:", e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
