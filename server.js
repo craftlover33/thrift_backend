@@ -1,6 +1,7 @@
 // ======================================================
-// THRIFT FASHION BACKEND v4 (FINAL)
-// Trending + Search + Lookup + Recommend + PriceHistory + ChartData
+// THRIFT FASHION BACKEND v5 (FINAL)
+// Trending + Search + Lookup + Recommend + PriceHistory
+// + Smart ChartData Expansion (no null results)
 // ======================================================
 
 import express from "express";
@@ -169,7 +170,7 @@ function normalizeThriftItem(item) {
 }
 
 // ======================================================
-// EBAY SEARCH WRAPPER (NO CATEGORY IDS)
+// EBAY SEARCH WRAPPER (BROWSE API)
 // ======================================================
 async function ebaySearch({ q, country = "US", extra = "" }) {
   const marketplace = resolveMarketplace(country);
@@ -346,6 +347,7 @@ app.get("/lookup", async (req, res) => {
     const json = await resp.json();
     let items = (json.itemSummaries || []).filter(isFashion);
 
+    // fallback search with q=
     if (items.length === 0) {
       const fallback = await ebaySearch({
         q: code,
@@ -555,70 +557,123 @@ app.get("/price-history", async (req, res) => {
 });
 
 // ======================================================
-// 6) /chart-data (30/60/90 HARI)
+// 6) /chart-data (SMART QUERY EXPANSION)
 // ======================================================
 app.get("/chart-data", async (req, res) => {
   try {
     const q = req.query.q;
-    if (!q) return res.status(400).json({ error: "Parameter 'q' wajib diisi" });
+    if (!q)
+      return res.status(400).json({ error: "Parameter 'q' wajib diisi" });
 
-    const url =
-      "https://svcs.ebay.com/services/search/FindingService/v1?" +
-      "OPERATION-NAME=findCompletedItems" +
-      "&SERVICE-VERSION=1.13.0" +
-      "&RESPONSE-DATA-FORMAT=JSON" +
-      `&SECURITY-APPNAME=${process.env.EBAY_APP_ID}` +
-      `&keywords=${encodeURIComponent(q)}` +
-      "&sortOrder=EndTimeSoonest" +
-      "&paginationInput.entriesPerPage=120";
+    // SMART EXPANSIONS
+    const expansions = [
+      q,
+      q.replace(/\s+/g, ""), // adidas sl72
+      q.replace(" ", "-"), // adidas sl-72
+      q.replace("-", " "), // adidas sl 72
+      q.split(" ").reverse().join(" "), // sl 72 adidas
+    ];
 
-    const resp = await fetch(url);
-    const json = await resp.json();
+    // Add thrift expansions
+    const lower = q.toLowerCase();
+    if (lower.includes("adidas") || lower.includes("nike")) {
+      expansions.push(
+        q + " retro",
+        q + " vintage",
+        q + " og",
+        q + " classic",
+      );
+    }
 
-    const items =
-      json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const uniq = [...new Set(expansions)];
 
-    const sold = items
-      .filter(it => it.sellingStatus?.[0]?.sellingState?.[0] === "EndedWithSales")
-      .map(it => {
-        const price = Number(
-          it.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0
-        );
-        const date = new Date(it.listingInfo?.[0]?.endTime?.[0]);
-        return { price, date };
+    async function fetchSold(keyword) {
+      const url =
+        "https://svcs.ebay.com/services/search/FindingService/v1?" +
+        "OPERATION-NAME=findCompletedItems" +
+        "&SERVICE-VERSION=1.13.0" +
+        "&RESPONSE-DATA-FORMAT=JSON" +
+        `&SECURITY-APPNAME=${process.env.EBAY_APP_ID}` +
+        `&keywords=${encodeURIComponent(keyword)}` +
+        "&sortOrder=EndTimeSoonest" +
+        "&paginationInput.entriesPerPage=120";
+
+      const resp = await fetch(url);
+      const json = await resp.json();
+
+      const items =
+        json?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+
+      const sold = items
+        .filter(
+          it => it.sellingStatus?.[0]?.sellingState?.[0] === "EndedWithSales"
+        )
+        .map(it => ({
+          price: Number(
+            it.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0
+          ),
+          date: new Date(it.listingInfo?.[0]?.endTime?.[0]),
+        }));
+
+      return sold;
+    }
+
+    // Combine all results
+    let combined = [];
+    for (const kw of uniq) {
+      const sold = await fetchSold(kw);
+      combined.push(...sold);
+    }
+
+    // Deduplicate
+    const map = new Map();
+    combined.forEach(item => {
+      const key = item.date.toISOString() + "-" + item.price;
+      if (!map.has(key)) map.set(key, item);
+    });
+    combined = [...map.values()];
+
+    combined.sort((a, b) => b.date - a.date);
+
+    if (combined.length === 0) {
+      return res.json({
+        query: q,
+        expanded_queries: uniq,
+        chart: { "30d": null, "60d": null, "90d": null },
       });
+    }
 
     const now = new Date();
-    const days = d => new Date(now.getTime() - d * 24 * 60 * 60 * 1000);
+    const daysAgo = d => new Date(now.getTime() - d * 86400000);
 
-    const ranges = {
-      "30d": sold.filter(i => i.date >= days(30)),
-      "60d": sold.filter(i => i.date >= days(60)),
-      "90d": sold.filter(i => i.date >= days(90)),
-    };
+    const rangeData = days =>
+      combined.filter(i => i.date >= daysAgo(days)).map(i => i.price);
 
-    const summary = range => {
-      if (range.length === 0) return null;
-      const prices = range.map(i => i.price);
+    const makeSummary = prices => {
+      if (!prices.length) return null;
       const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
       return {
-        count: range.length,
+        count: prices.length,
         average: Number(avg.toFixed(2)),
         lowest: Math.min(...prices),
         highest: Math.max(...prices),
       };
     };
 
+    const chart = {
+      "30d": makeSummary(rangeData(30)),
+      "60d": makeSummary(rangeData(60)),
+      "90d": makeSummary(rangeData(90)),
+    };
+
     res.json({
       query: q,
-      chart: {
-        "30d": summary(ranges["30d"]),
-        "60d": summary(ranges["60d"]),
-        "90d": summary(ranges["90d"]),
-      },
+      expanded_queries: uniq,
+      total_sold_combined: combined.length,
+      chart,
     });
   } catch (err) {
-    console.error("❌ Chart data error:", err);
+    console.error("❌ Chart Data Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -627,12 +682,14 @@ app.get("/chart-data", async (req, res) => {
 // ROOT
 // ======================================================
 app.get("/", (req, res) => {
-  res.send("🔥 Thrift Fashion Backend v4 (Trending + Search + Lookup + Recommend + PriceHistory + ChartData) is running.");
+  res.send(
+    "🔥 Thrift Fashion Backend v5 (Trending + Search + Lookup + Recommend + PriceHistory + SmartChart) is running."
+  );
 });
 
 // ======================================================
 // START SERVER
 // ======================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Thrift Fashion Backend v4 running on port ${PORT}`);
+  console.log(`🚀 Thrift Fashion Backend v5 running on port ${PORT}`);
 });
